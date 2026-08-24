@@ -1,0 +1,174 @@
+name: Playwright
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      update_visual_baseline:
+        description: 'Capture a fresh Linux visual baseline instead of running the regular suite'
+        type: boolean
+        default: false
+
+env:
+  UI_BASE_URL: https://demoqa.com
+  API_BASE_URL: https://reqres.in
+
+jobs:
+  static-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+
+  check-secrets:
+    runs-on: ubuntu-latest
+    outputs:
+      has_api_key: ${{ steps.check.outputs.has_api_key }}
+      has_slack: ${{ steps.check.outputs.has_slack }}
+    steps:
+      - id: check
+        env:
+          REQRES_API_KEY: ${{ secrets.REQRES_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          echo "has_api_key=$([ -n "$REQRES_API_KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "has_slack=$([ -n "$SLACK_WEBHOOK_URL" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  ui-smoke:
+    needs: static-quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:ui:smoke
+        env:
+          DEMO_USER: ${{ secrets.DEMO_USER }}
+          DEMO_PASSWORD: ${{ secrets.DEMO_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-smoke-report
+          path: html-report/
+          retention-days: 14
+
+  api:
+    needs: [static-quality, check-secrets]
+    if: ${{ needs.check-secrets.outputs.has_api_key == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:api
+        env:
+          REQRES_API_KEY: ${{ secrets.REQRES_API_KEY }}
+
+  full-regression:
+    needs: ui-smoke
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.update_visual_baseline != 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium firefox webkit
+      - run: npm run test:ui:cross-browser
+        env:
+          DEMO_USER: ${{ secrets.DEMO_USER }}
+          DEMO_PASSWORD: ${{ secrets.DEMO_PASSWORD }}
+      - run: npm run test:a11y
+      - run: npm run test:visual -- --update-snapshots=none
+      - run: npm run test:mobile
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-regression-report
+          path: |
+            html-report/
+            allure-results/
+          retention-days: 14
+
+  visual-baseline:
+    needs: static-quality
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.update_visual_baseline == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:visual -- --update-snapshots
+      - uses: actions/upload-artifact@v4
+        with:
+          name: visual-baseline-linux
+          path: tests/visual/**/*-linux.png
+          retention-days: 14
+
+  db:
+    needs: static-quality
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:db
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: postgres
+
+  notify:
+    needs: [full-regression, db, check-secrets]
+    if: ${{ always() && github.event_name == 'push' && needs.check-secrets.outputs.has_slack == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_CHANNEL: '#playwright-test-reports'
+          SLACK_USERNAME: Playwright GitHub Actions
+          SLACK_MESSAGE: 'Full regression run for ${{ github.repository }}@${{ github.sha }}: ${{ needs.full-regression.result }} (UI/a11y/visual/mobile), db: ${{ needs.db.result }}.'

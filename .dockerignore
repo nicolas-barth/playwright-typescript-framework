@@ -1,0 +1,16 @@
+node_modules/
+.git/
+.github/
+.env
+
+test-results/
+playwright-report/
+allure-results/
+allure-report/
+html-report/
+html-report.zip
+logs/
+Downloads/
+
+.vscode/
+.idea/
